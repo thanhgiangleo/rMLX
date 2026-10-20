@@ -845,6 +845,31 @@ fn qwen3_renders_full_tool_conversation() {
     );
 }
 
+/// OpenAI tool arguments are JSON-encoded strings on the wire, then parsed to
+/// maps before template rendering. Python/Jinja templates commonly call
+/// `arguments.items()` to iterate that map; Minijinja must provide the same
+/// method behavior.
+#[test]
+fn python_dict_items_method_renders_tool_arguments() {
+    let tpl = ChatTemplate::new(
+        "{% for m in messages %}{% for tc in m.tool_calls %}{% for key, value in tc.function.arguments.items() %}{{ key }}={{ value }};{% endfor %}{% endfor %}{% endfor %}".to_owned(),
+    )
+    .expect("compile");
+    let tool_calls = serde_json::json!([{
+        "id": "call_x",
+        "type": "function",
+        "function": {"name": "fixed_result", "arguments": {"value": "CANARY_OK"}}
+    }]);
+    let messages = [ChatMessageTpl {
+        role: "assistant",
+        content: "",
+        tool_calls: Some(&tool_calls),
+        ..Default::default()
+    }];
+    let rendered = tpl.render(&messages, &NO_OPTS).expect("render");
+    assert_eq!(rendered.text.trim(), "value=CANARY_OK;");
+}
+
 /// Invariant: a plain system+user render must be byte-identical to the
 /// pre-tool-support output. Same fixture as
 /// `qwen36_render_matches_hf_reference_byte_for_byte`; guards that the
