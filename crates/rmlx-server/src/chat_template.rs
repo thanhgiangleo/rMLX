@@ -407,6 +407,7 @@ impl ChatTemplate {
     /// real HuggingFace chat templates commonly call:
     ///
     /// - `dict.get(key)` → attribute access (returns `undefined` if missing)
+    /// - `dict.items()` → the built-in `items` filter
     /// - `str.split(sep)` → split string into sequence
     ///
     /// Also registers the `raise_exception(msg)` function HuggingFace gives
@@ -414,7 +415,7 @@ impl ChatTemplate {
     pub fn new(source: String) -> Result<Self> {
         let mut env = Environment::<'static>::new();
 
-        // ── Python compat: .get() and .split() via unknown_method_callback ──
+        // ── Python compat methods via unknown_method_callback ──
         env.set_unknown_method_callback(|_state, value, method, args| {
             match method {
                 "get" => {
@@ -427,6 +428,16 @@ impl ChatTemplate {
                             Ok(v) if !v.is_undefined() => Ok(v),
                             _ => Ok(default_val),
                         }
+                    } else {
+                        Err(MjError::from(ErrorKind::UnknownMethod))
+                    }
+                }
+                "items" => {
+                    // Python dict.items() → Minijinja's built-in `items` filter.
+                    // HuggingFace templates use this when rendering parsed
+                    // function-call arguments in a multi-turn tool conversation.
+                    if value.kind() == ValueKind::Map && args.is_empty() {
+                        _state.apply_filter("items", &[value.clone()])
                     } else {
                         Err(MjError::from(ErrorKind::UnknownMethod))
                     }
