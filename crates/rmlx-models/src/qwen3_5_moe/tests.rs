@@ -3551,3 +3551,156 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
          HydratedTail matches the cold reference logits"
     );
 }
+
+/// Model-level decode parity gate for the first Qwen3.5 hybrid batch primitive.
+///
+/// It compares one B=2 decode call against two independent B=1 forwards after
+/// different-length prefills. This specifically pins: per-row full-attention
+/// offsets/KV caches, per-row GatedDeltaNet conv + delta state, and cache
+/// isolation. It is an integration cell because it needs a real Qwen3.5
+/// checkpoint and Metal.
+///
+/// Run on a local Qwen3.5 snapshot (the current coder checkpoint is suitable):
+/// ```sh
+/// RMLX_TEST_MODEL_QWEN35_BATCH=/path/to/Qwen3.8-27B-snapshot \
+/// cargo test -p rmlx-models --lib qwen35_batched_decode_matches_independent_rows \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn qwen35_batched_decode_matches_independent_rows() {
+    let Some(model_path) = std::env::var_os("RMLX_TEST_MODEL_QWEN35_BATCH") else {
+        eprintln!("set RMLX_TEST_MODEL_QWEN35_BATCH to a local Qwen3.5 snapshot");
+        return;
+    };
+    let model = load_from_path(std::path::Path::new(&model_path)).expect("load Qwen3.5 snapshot");
+    let device = Device::Gpu;
+    let prompts = [vec![1_u32, 2, 3], vec![4_u32, 5, 6, 7, 8]];
+    let next_ids = [11_u32, 13_u32];
+
+    let run_codec = |kv_quant: rmlx_kv_quant::KvQuant| {
+        let fresh_caches = || -> (
+            Vec<rmlx_kv_quant::KvCache>,
+            Vec<rmlx_kv_quant::LinearAttnCache>,
+        ) {
+            let kv = crate::kv_cache::kv_layer_quants(
+                model.cfg.num_hidden_layers,
+                kv_quant,
+                SHARES_KV_ACROSS_LAYERS,
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(idx, q)| rmlx_kv_quant::KvCache::with_quant_max_seq(q, 4096).with_layer_idx(idx))
+            .collect::<Vec<_>>();
+            let linear = (0..model.cfg.num_hidden_layers)
+                .map(|_| rmlx_kv_quant::LinearAttnCache::new())
+                .collect::<Vec<_>>();
+            (kv, linear)
+        };
+        let prefill = |ids: &[u32],
+                       caches: &mut (
+            Vec<rmlx_kv_quant::KvCache>,
+            Vec<rmlx_kv_quant::LinearAttnCache>,
+        )| {
+            for cache in &mut caches.0 {
+                cache.enter_prefill();
+            }
+            model
+                .forward_seq_with_cache(ids, Some(&mut caches.0), Some(&mut caches.1), device)
+                .expect("batch parity prefill");
+            for cache in &mut caches.0 {
+                cache.exit_prefill(device).expect("exit KV prefill");
+            }
+        };
+
+        let mut independent0 = fresh_caches();
+        let mut independent1 = fresh_caches();
+        let mut batched0 = fresh_caches();
+        let mut batched1 = fresh_caches();
+
+        // Give each row a distinct GDN state and FA offset before comparing
+        // the next token. Different prompt lengths catch any accidental shared
+        // offset. The same gate runs for bf16 and an affine KV codec: attention
+        // is intentionally per-row so each codec stays on its B=1 kernel path.
+        prefill(&prompts[0], &mut independent0);
+        prefill(&prompts[1], &mut independent1);
+        prefill(&prompts[0], &mut batched0);
+        prefill(&prompts[1], &mut batched1);
+
+        let ids = Array::from_i32_slice(&[next_ids[0] as i32, next_ids[1] as i32], &[2, 1])
+            .expect("batched token ids");
+        let batched_logits = model
+            .forward_batch_arr(
+                &ids,
+                &mut [batched0.0.as_mut_slice(), batched1.0.as_mut_slice()],
+                &mut [batched0.1.as_mut_slice(), batched1.1.as_mut_slice()],
+                device,
+            )
+            .expect("batched decode forward");
+        let batched_rows = logit_rows(&batched_logits, 2, device);
+
+        let token0 = Array::from_i32_slice(&[next_ids[0] as i32], &[1]).expect("row 0 token");
+        let logits0 = model
+            .forward_arr(
+                &token0,
+                1,
+                Some(&mut independent0.0),
+                Some(&mut independent0.1),
+                device,
+            )
+            .expect("independent row 0 decode forward");
+        let single0 = logit_rows(&logits0, 1, device).remove(0);
+        let token1 = Array::from_i32_slice(&[next_ids[1] as i32], &[1]).expect("row 1 token");
+        let logits1 = model
+            .forward_arr(
+                &token1,
+                1,
+                Some(&mut independent1.0),
+                Some(&mut independent1.1),
+                device,
+            )
+            .expect("independent row 1 decode forward");
+        let single1 = logit_rows(&logits1, 1, device).remove(0);
+
+        for (row, batched_logits, single) in [
+            (0, &batched_rows[0], &single0),
+            (1, &batched_rows[1], &single1),
+        ] {
+            let diff = max_abs_diff(batched_logits, single);
+            assert!(
+                diff <= 2.0,
+                "{kv_quant:?}, row {row}: max logit diff {diff} exceeds 2.0"
+            );
+            assert_eq!(
+                argmax_row(batched_logits),
+                argmax_row(single),
+                "{kv_quant:?}, row {row}: batch changed greedy token"
+            );
+        }
+
+        let first_fa = model.cfg.full_attention_interval.saturating_sub(1);
+        assert_eq!(
+            batched0.0[first_fa].offset(),
+            independent0.0[first_fa].offset()
+        );
+        assert_eq!(
+            batched1.0[first_fa].offset(),
+            independent1.0[first_fa].offset()
+        );
+        for layer in 0..model.cfg.num_hidden_layers {
+            assert_eq!(
+                batched0.1[layer].resident_bytes(),
+                independent0.1[layer].resident_bytes(),
+                "{kv_quant:?}, row 0, layer {layer}: GDN state residency differs"
+            );
+            assert_eq!(
+                batched1.1[layer].resident_bytes(),
+                independent1.1[layer].resident_bytes(),
+                "{kv_quant:?}, row 1, layer {layer}: GDN state residency differs"
+            );
+        }
+    };
+
+    run_codec(rmlx_kv_quant::KvQuant::None);
+    run_codec(rmlx_kv_quant::KvQuant::K8V8);
+}
