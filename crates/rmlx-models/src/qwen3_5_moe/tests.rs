@@ -3669,6 +3669,7 @@ fn qwen35_batched_decode_matches_independent_rows() {
             (1, &batched_rows[1], &single1),
         ] {
             let diff = max_abs_diff(batched_logits, single);
+            println!("BATCH_PARITY codec={kv_quant:?} row={row} max_abs_logit_diff={diff:.9}");
             assert!(
                 diff <= 2.0,
                 "{kv_quant:?}, row {row}: max logit diff {diff} exceeds 2.0"
