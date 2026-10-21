@@ -394,7 +394,7 @@ const SPECULATIVE_LOOPS: [&str; 4] = [
 ];
 
 /// The loops that do work and do not read the stop, each with its bound.
-const BOUNDED_LOOPS: [(&str, &str); 23] = [
+const BOUNDED_LOOPS: [(&str, &str); 25] = [
     ("gemma3/vision.rs::build_inputs_embeds: for (img_idx, pv) in images.iter().enumerate() {", "it builds the graph of every image, and one evaluation after the loop runs them all"),
     ("gemma3/vision.rs::forward: for blk in &self.encoder {", "the layers of one tower forward, built as one graph"),
     ("gemma4/vision/mod.rs::build_inputs_embeds: for (img_idx, pv) in images.iter().enumerate() {", "it builds the graph of every image, and one evaluation after the loop runs them all"),
@@ -406,6 +406,8 @@ const BOUNDED_LOOPS: [(&str, &str); 23] = [
     ("ppl.rs::sliding_window_ppl: while start < tokens.len() {", "the perplexity command, which no request of the server runs"),
     ("qwen3_5_moe/loader.rs::load_from_path: for i in 0..cfg.num_hidden_layers {", "a model load, which a stop of a request does not cut"),
     ("qwen3_5_moe/loader.rs::load_from_path_paro: for i in 0..cfg.num_hidden_layers {", "a model load, which a stop of a request does not cut"),
+    ("qwen3_5_moe/batch.rs::forward_batch_arr: for row in 0..batch {", "the validated active batch size; full-attention cache updates remain per-row"),
+    ("qwen3_5_moe/batch.rs::forward_rows_sequential: for row in 0..batch {", "the caller's validated active batch size; the scheduler supplies a bounded batch cap"),
     ("qwen3_vl_moe/vision.rs::attend_tiled: while qs < seq {", "the tiles of one attention in one block; the block loop reads the stop"),
     ("speculative/dflash/mod.rs::greedy_block_tokens: for pos in 1..block_size {", "the positions of one draft block"),
     ("speculative/eagle3/mod.rs::draft_block: for _ in 0..n_iters {", "the draft block of one round; the stop is read at the head of the round"),

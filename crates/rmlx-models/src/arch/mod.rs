@@ -613,6 +613,45 @@ impl Architecture {
         }
     }
 
+    /// Whether this architecture has a decode path that accepts several
+    /// independent request cache sets in one scheduler tick.
+    ///
+    /// This is a model-kernel capability only; it does not mean the HTTP
+    /// server currently schedules requests into batches. A server scheduler
+    /// must still provide one cache row per request and preserve per-request
+    /// sampling/stream state. Architectures without the implementation remain
+    /// on the existing single-sequence path.
+    #[must_use]
+    pub fn supports_batched_decode(&self) -> bool {
+        matches!(self, Architecture::Qwen3_5Moe(_))
+    }
+
+    /// Decode one token for each row using architecture-aware batched work.
+    ///
+    /// `input_ids` is `[B, 1]`; each element in `kv_cache_rows` and
+    /// `lin_cache_rows` is the independent per-request cache stack for that
+    /// row. The Qwen3.5 hybrid path batches GatedDeltaNet recurrent math and
+    /// MLP/MoE projections while keeping full-attention KV updates row-wise.
+    /// This preserves each request's cache offset and KV codec, including
+    /// codecs whose fused kernels only accept batch size one. This low-level
+    /// primitive does not itself own a request scheduler.
+    pub fn forward_batched_decode(
+        &self,
+        input_ids: &Array,
+        kv_cache_rows: &mut [&mut [rmlx_kv_quant::KvCache]],
+        lin_cache_rows: &mut [&mut [rmlx_kv_quant::LinearAttnCache]],
+        device: Device,
+    ) -> Result<Array> {
+        match self {
+            Architecture::Qwen3_5Moe(model) => {
+                model.forward_batch_arr(input_ids, kv_cache_rows, lin_cache_rows, device)
+            }
+            _ => Err(Error::Unimplemented(
+                "batched decode is not implemented for this architecture",
+            )),
+        }
+    }
+
     /// Cache-using single-token forward.
     ///
     /// Returns logits at the last position, shape `[1, 1, vocab_size]`,
