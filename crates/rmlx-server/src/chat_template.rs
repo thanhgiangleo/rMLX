@@ -416,7 +416,7 @@ impl ChatTemplate {
         let mut env = Environment::<'static>::new();
 
         // ── Python compat methods via unknown_method_callback ──
-        env.set_unknown_method_callback(|_state, value, method, args| {
+        env.set_unknown_method_callback(|state, value, method, args| {
             match method {
                 "get" => {
                     // dict.get(key) or dict.get(key, default)
@@ -437,7 +437,7 @@ impl ChatTemplate {
                     // HuggingFace templates use this when rendering parsed
                     // function-call arguments in a multi-turn tool conversation.
                     if value.kind() == ValueKind::Map && args.is_empty() {
-                        _state.apply_filter("items", &[value.clone()])
+                        state.apply_filter("items", std::slice::from_ref(value))
                     } else {
                         Err(MjError::from(ErrorKind::UnknownMethod))
                     }
