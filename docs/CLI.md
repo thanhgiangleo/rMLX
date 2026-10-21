@@ -249,6 +249,7 @@ Prints architecture and quantization metadata without running inference.
 rmlx info --model /path/to/snapshot
 rmlx info --list-cache-types
 rmlx info --model /path/to/snapshot --probe-smoke
+rmlx info --model /path/to/snapshot --estimate-memory --max-tokens 32768
 ```
 
 | Flag | Type | Default | Description |
@@ -259,10 +260,55 @@ rmlx info --model /path/to/snapshot --probe-smoke
 | `--probe-smoke` | bool flag | off | 8-token smoke probe. Exit `0` ok, `1` broken, `3` load failed, `4` inconclusive, `5` unsupported architecture. |
 | `--device` | `cpu \| gpu` | `gpu` | Device for the probes. |
 | `--max-ctx` | u32 | `min(capacity, 4096)` | Context ceiling; see "Context ceiling". |
+| `--estimate-memory` | bool flag | off | Prints a byte-exact preflight memory estimate and exits — no MLX runtime / Metal claim taken. See "Memory estimate" below. |
+| `--max-tokens` | u64 | `4096` | Context length to size `kv_bytes_total` at. Requires `--estimate-memory`. |
+| `--json` | bool flag | off | Emits `--estimate-memory`'s report as one JSON object. Requires `--estimate-memory`. |
 
 Plus the KV codec flags, without `--kv-boundary-layers`. The smoke probe
 renders its seed prompt through the snapshot's `chat_template.jinja` when
 there is one, so it sees the input a served request sees.
+
+#### Memory estimate (`--estimate-memory`)
+
+Reads `config.json` and the shard index only — no tensor bytes, no MLX
+runtime, no Metal claim. Honours `--kv-quant` / `--kv-preset` /
+`--cache-type-k` / `--cache-type-v` / `--kv-bits` the same way the rest of
+`info` does, so the KV side of the estimate reflects the codec a real `serve`
+run with the same flags would resolve.
+
+```bash
+$ rmlx info --model /path/to/qwen3.5-coder --estimate-memory --max-tokens 16384
+memory estimate (--max-tokens 16384):
+  weights_bytes:        17022809352  (15.85 GiB)
+  kv_bytes_total:        1073741824  (1.00 GiB, 16 of 64 layers hold KV)
+  activation_bytes:       805306368  (0.75 GiB, fixed allowance)
+  total_bytes:          18901857544  (17.60 GiB)
+
+  headroom_bytes:       15461882266  (14.40 GiB, 15% of physical RAM)
+  budget_bytes:         87617332838  (81.60 GiB, physical RAM minus headroom)
+
+  fits: true
+```
+
+| Field | Source |
+|---|---|
+| `weights_bytes` | The shard index's `metadata.total_size` (present on every multi-shard HuggingFace snapshot); falls back to the sum of on-disk shard file sizes when that field is absent. |
+| `kv_bytes_total` | `KvQuant::estimated_resident_bytes_per_layer(max_tokens, head_dim, kv_heads, shares_kv=false)` × the number of layers that hold a real KV cache. On a hybrid snapshot (`text_config.layer_types` present — Qwen3.5-family GatedDeltaNet hybrids), only `"full_attention"` layers count; linear/SSM layers hold no KV. Without `layer_types`, every `num_hidden_layers` layer counts (dense Qwen2/Qwen3, Gemma3, BitNet, Laguna). `shares_kv=false` is the conservative (larger) side: a codec whose cache actually shares K/V storage across layers would resident fewer bytes than this reports. |
+| `activation_bytes` | A fixed 768 MiB allowance for prefill/decode transient activations — not a per-arch measurement. Gate 2 of the multi-agent serving plan (`rust-inference-landscape.html`) measured Metal peak allocation at 18.2 GB against ~17.0 GB of weights for the Qwen3.8-27B coder checkpoint at `auto` KV-quant and a 16384-token ceiling; this estimator's `total_bytes` for the same inputs comes out at 17.60 GiB — about 0.6 GB (3%) under the measured peak, so this is a close but not perfectly conservative estimate, not a hard upper bound. |
+| `headroom_bytes` | 15% of physical RAM (`rmlx_core::system::physical_memory_bytes`), matching the OS-headroom convention chosen for the multi-process budget ledger. |
+| `budget_bytes` | `physical RAM - headroom_bytes`. |
+| `fits` | `total_bytes <= budget_bytes`. Process exit code: `0` = fits, `1` = does not fit, `3` = the snapshot's config lacks a field this estimator needs (`num_hidden_layers`, resolvable `head_dim`, or `num_key_value_heads`/`num_attention_heads`) — this is a distinct outcome from "does not fit", surfaced as its own exit code rather than collapsed into one of the other two. |
+
+Known gaps, stated rather than silently absorbed into the number: this does
+not model Metal driver transient allocation precisely, prompt-cache growth
+beyond one request, prefill chunk buffers at a specific `--prefill-step-size`,
+or per-tensor quant overrides' effect on weight bytes (the shard index's
+declared size already reflects whatever mix of bf16/affine/mxfp/ParoQuant
+tensors the snapshot ships, so overrides are implicitly priced in — but the
+estimator does not verify that per-tensor layout, only trusts the declared
+total). Treat this as a preflight signal, not a guarantee; the memory-safety
+protocol in the multi-agent plan's Gate 2 (`vm_stat` reclaimable + debounce)
+remains the authority once a process actually runs.
 
 ---
 
@@ -543,6 +589,19 @@ see another user's process), then `kill <PID>`. Never delete the claim file.
 model load. `cpu` takes no claim; it refuses every KV codec but `none`
 (`--kv-quant auto` resolves to `none`) and every later GPU stream or Metal
 call. `--gpu-capture` needs `--device gpu`.
+
+`serve` also accepts the explicitly experimental
+`--experimental-multi-process-budget <GB_f64>`. It replaces the exclusive
+claim for that server with a reservation in `/var/tmp/rmlx.budget.json`, using
+physical RAM minus 15% OS headroom. It requires GPU mode (the default); a reservation
+that exceeds the remaining budget is refused with exit code `12`. The flag is
+off by default, and omitting it preserves the exit-code-11 exclusive-claim
+behavior exactly. This requested-budget ledger is not measured peak memory:
+do not launch multiple real model processes until the G2.6 memory preflight
+has passed. See [`SERVER_CLAIM.md`](SERVER_CLAIM.md) for ledger and cleanup
+semantics. To roll back, stop all experimental servers, then launch without
+the flag; no claim file needs to be deleted. The default exclusive mode cannot
+coordinate with an experimental process that is still running.
 
 `rmlx claim run -- <command>` holds the claim for `<command>` and exits with
 its status — the command's own code, or `128 + <signal>` if a signal killed

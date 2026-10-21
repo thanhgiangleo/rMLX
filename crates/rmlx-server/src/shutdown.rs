@@ -37,7 +37,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
-use crate::claim::MetalClaim;
+use crate::claim::GpuClaim;
 use crate::openai::errors::service_unavailable;
 
 /// How long the open requests have, from the first signal, to send their
@@ -271,7 +271,7 @@ async fn end_of_the_reply_wait(
 /// With the panic of `serving`, after the runtime ended.
 pub fn block_on_serve<F>(
     rt: tokio::runtime::Runtime,
-    claim: Option<&MetalClaim>,
+    claim: Option<&GpuClaim>,
     serving: F,
 ) -> anyhow::Result<()>
 where
@@ -284,7 +284,7 @@ where
 /// deadline.
 pub(crate) fn block_on_serve_within<F>(
     rt: tokio::runtime::Runtime,
-    claim: Option<&MetalClaim>,
+    claim: Option<&GpuClaim>,
     serving: F,
     exit: Duration,
 ) -> anyhow::Result<()>
@@ -308,7 +308,7 @@ where
 
 /// End `rt` at `deadline`: its blocking jobs are awaited until then. When it
 /// does not end in time, `claim` stays held until the process is gone.
-fn end_runtime(rt: tokio::runtime::Runtime, deadline: Instant, claim: Option<&MetalClaim>) {
+fn end_runtime(rt: tokio::runtime::Runtime, deadline: Instant, claim: Option<&GpuClaim>) {
     let left = deadline.saturating_duration_since(Instant::now());
     let started = Instant::now();
     rt.shutdown_timeout(left);
@@ -327,7 +327,7 @@ fn end_runtime(rt: tokio::runtime::Runtime, deadline: Instant, claim: Option<&Me
     }
 }
 
-fn hold_claim_until_exit(claim: &MetalClaim) {
+fn hold_claim_until_exit(claim: &GpuClaim) {
     match claim.hold_until_process_exit() {
         Ok(()) => info!("Metal claim stays held until the process is gone"),
         Err(e) => warn!(error = %e, "Metal claim could not be held past its guard"),

@@ -434,3 +434,52 @@ fn a_pin_refusal_names_the_fix_for_its_cause() {
         "{pair}"
     );
 }
+
+#[test]
+fn experimental_multi_process_budget_flag_is_serve_only_and_optional() {
+    let default =
+        try_parse_cli(["rmlx", "serve"]).expect("serve without the experimental flag parses");
+    let experimental = try_parse_cli([
+        "rmlx",
+        "serve",
+        "--experimental-multi-process-budget",
+        "12.5",
+    ])
+    .expect("experimental budget parses as an f64");
+    match (default.cmd, experimental.cmd) {
+        (
+            super::Cmd::Serve {
+                experimental_multi_process_budget: None,
+                ..
+            },
+            super::Cmd::Serve {
+                experimental_multi_process_budget: Some(value),
+                ..
+            },
+        ) => assert_eq!(value, 12.5),
+        _ => panic!("serve budget flag must remain optional and preserve its value"),
+    }
+    let other_command = try_parse_cli([
+        "rmlx",
+        "chat",
+        "--experimental-multi-process-budget",
+        "12.5",
+    ]);
+    assert!(other_command.is_err(), "budget override is serve-only");
+}
+
+#[test]
+fn memory_budget_refusal_maps_to_exit_code_12() {
+    let refused = crate::commands::parse::check_budget_claim::<()>(Err(
+        rmlx_server::ClaimError::BudgetExceeded {
+            requested_gb: 8.0,
+            allocated_gb: 2.0,
+            limit_gb: 9.0,
+        },
+    ))
+    .map(|()| 0);
+    assert_eq!(
+        crate::exit::exit_code(refused).expect("budget refusal is an exit code"),
+        12
+    );
+}

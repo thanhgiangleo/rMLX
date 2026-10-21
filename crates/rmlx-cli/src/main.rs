@@ -151,8 +151,8 @@ use commands::serve::{
 use commands::{
     build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo, parse_kv_bits_fractional,
     parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant, parse_max_ctx,
-    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline, run_bench,
-    run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
+    parse_max_prompt_tokens, parse_serve_device, resolve_model_flags, resolve_preset_arg,
+    run_baseline, run_bench, run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
@@ -543,6 +543,12 @@ enum Cmd {
         /// hit the Metal watchdog timeout. Use --device cpu to run on the CPU.
         #[arg(long, value_parser = ["cpu", "gpu"])]
         device: Option<String>,
+        /// Experimental per-process unified-memory reservation for concurrent
+        /// rMLX GPU servers. Defaults off; without this flag the exclusive
+        /// machine-wide Metal claim is unchanged. This reservation is not a
+        /// substitute for the G2.6 measured-memory preflight.
+        #[arg(long, value_name = "GB_f64")]
+        experimental_multi_process_budget: Option<f64>,
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
@@ -1123,6 +1129,23 @@ enum Cmd {
         /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long)]
         max_ctx: Option<u32>,
+        /// Print a byte-exact preflight memory estimate and exit — no MLX
+        /// runtime / Metal context is taken. Reports weights_bytes (from the
+        /// shard index), kv_bytes_total (at --max-tokens, under --kv-quant /
+        /// --kv-bits if given), a fixed activation allowance, headroom_bytes
+        /// (15% of physical RAM) and whether the total fits the remaining
+        /// budget. Exit 0 = fits, 1 = does not fit, 3 = could not resolve the
+        /// config fields this estimate needs.
+        #[arg(long, default_value_t = false)]
+        estimate_memory: bool,
+        /// Context length to size kv_bytes_total at, for --estimate-memory.
+        /// Defaults to 4096. Ignored without --estimate-memory.
+        #[arg(long, default_value_t = 4096, requires = "estimate_memory")]
+        max_tokens: u64,
+        /// Emit --estimate-memory's report as one JSON object instead of
+        /// human-readable text. Ignored without --estimate-memory.
+        #[arg(long, default_value_t = false, requires = "estimate_memory")]
+        json: bool,
     },
     /// Manage the metrics SQLite database (schema init, health checks, backup/restore).
     Metrics(MetricsCmd),
@@ -2040,6 +2063,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             port,
             host,
             device,
+            experimental_multi_process_budget,
             kv_quant,
             kv_preset,
             cache_type_k,
@@ -2330,7 +2354,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 return Err(anyhow::anyhow!(msg));
             }
 
-            let claimed = parse_device(&device)?;
+            let claimed = parse_serve_device(&device, experimental_multi_process_budget)?;
             claimed.admits(kv_quant_final.as_slice())?;
             // Build YARN override from CLI flags. None when either flag is absent.
             let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
@@ -2466,6 +2490,9 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             kv_group_size,
             list_cache_types,
             max_ctx,
+            estimate_memory,
+            max_tokens,
+            json,
         } => {
             // `--list-cache-types` prints the codec table and exits
             // before any model load. clap's `required_unless_present` guarantees
@@ -2476,6 +2503,35 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 return Ok(0);
             }
             let model = model.expect("clap required_unless_present guarantees model is Some");
+            // `--estimate-memory` is a config-only preflight: no MLX runtime,
+            // no Metal claim, no probe. Resolve the KV-quant codec the same
+            // way the rest of `info` does below (honours --kv-quant /
+            // --kv-preset / --cache-type-k/v / --kv-bits), then print the
+            // estimate and return its exit code without reaching any probe
+            // path.
+            if estimate_memory {
+                let kv_quant_est = if let Some(preset_arg) = kv_preset {
+                    let cfg = rmlx_loader::load_config(&model)
+                        .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
+                    let preset_kq = resolve_preset_arg(preset_arg);
+                    commands::parse::resolve_kv_quant(&cfg, Some(preset_kq), None)?
+                } else {
+                    resolve_model_flags(
+                        &model,
+                        &kv_quant,
+                        cache_type_k.as_deref(),
+                        cache_type_v.as_deref(),
+                        None,
+                        "rmlx info --estimate-memory",
+                        kv_bits,
+                        kv_group_size,
+                    )?
+                    .0
+                };
+                let exit_code =
+                    commands::run_estimate_memory(&model, max_tokens, kv_quant_est, json)?;
+                return Ok(exit_code);
+            }
             // Always run the cache-type resolver (it loads config + fails
             // fast on invalid combos even when no probe is requested). The
             // resolved KvQuant is only handed downstream when a probe will

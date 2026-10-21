@@ -36,7 +36,7 @@
 use rmlx_kv_quant::DeviceRefusesCodec;
 use rmlx_mlx::Device;
 use rmlx_models::kv_cache::KvBoundary;
-use rmlx_server::{try_claim, ClaimError, MetalClaim};
+use rmlx_server::{try_claim, try_claim_with_budget, ClaimError, GpuClaim};
 use tracing::error;
 
 use crate::exit::ExitWith;
@@ -49,7 +49,7 @@ use crate::commands::preset_table::{lookup_preset, PresetError, AVAILABLE_NAMES}
 #[derive(Debug)]
 pub(crate) struct ClaimedDevice {
     device: Device,
-    claim: Option<MetalClaim>,
+    claim: Option<GpuClaim>,
 }
 
 impl ClaimedDevice {
@@ -69,7 +69,7 @@ impl ClaimedDevice {
         self.claim.is_some()
     }
 
-    pub(crate) fn claim(&self) -> Option<&MetalClaim> {
+    pub(crate) fn claim(&self) -> Option<&GpuClaim> {
         self.claim.as_ref()
     }
 
@@ -98,6 +98,29 @@ pub(crate) fn parse_device(s: &str) -> anyhow::Result<ClaimedDevice> {
     Ok(claimed)
 }
 
+/// Parse the serve device and choose the budget claim only when the explicit
+/// experimental flag is present. The default branch remains `parse_device`'s
+/// original exclusive-claim path.
+pub(crate) fn parse_serve_device(s: &str, budget_gb: Option<f64>) -> anyhow::Result<ClaimedDevice> {
+    let Some(budget_gb) = budget_gb else {
+        return parse_device(s);
+    };
+    if s != "gpu" {
+        anyhow::bail!("--experimental-multi-process-budget requires --device gpu");
+    }
+    if !budget_gb.is_finite() || budget_gb <= 0.0 {
+        anyhow::bail!("--experimental-multi-process-budget must be a finite positive number");
+    }
+    let claimed = check_budget_claim(claim_gpu_with_budget(budget_gb))?;
+    tracing::info!(
+        device = s,
+        claim = true,
+        budget_gb,
+        "resolved serve device with experimental memory budget"
+    );
+    Ok(claimed)
+}
+
 fn device_from_flag(
     s: &str,
     claim_gpu: impl FnOnce() -> anyhow::Result<ClaimedDevice>,
@@ -122,8 +145,31 @@ fn device_from_flag(
 pub(crate) fn claim_gpu() -> Result<ClaimedDevice, ClaimError> {
     try_claim().map(|claim| ClaimedDevice {
         device: Device::Gpu,
-        claim: Some(claim),
+        claim: Some(GpuClaim::Metal(claim)),
     })
+}
+
+fn claim_gpu_with_budget(budget_gb: f64) -> Result<ClaimedDevice, ClaimError> {
+    try_claim_with_budget(budget_gb).map(|claim| ClaimedDevice {
+        device: Device::Gpu,
+        claim: Some(GpuClaim::Budget(claim)),
+    })
+}
+
+pub(crate) fn check_budget_claim<T>(claim: Result<T, ClaimError>) -> anyhow::Result<T> {
+    match claim {
+        Ok(held) => Ok(held),
+        Err(error @ ClaimError::BudgetExceeded { .. }) => {
+            error!(error = %error, "experimental memory budget exhausted — refusing to start");
+            eprintln!("error: {error}\nrMLX exits with code 12.");
+            Err(ExitWith(12).into())
+        }
+        Err(error @ ClaimError::AlreadyHeld { .. }) => check_claim(Err(error)),
+        Err(error) => {
+            error!(error = %error, "experimental memory budget ledger error");
+            Err(anyhow::anyhow!("memory budget claim: {error}"))
+        }
+    }
 }
 
 /// Report a claim refusal and turn it into exit code 11; any other claim error

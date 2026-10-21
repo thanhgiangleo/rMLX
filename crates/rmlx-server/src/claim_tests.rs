@@ -1,9 +1,10 @@
 use super::*;
-use std::io::{BufRead as _, BufReader, IsTerminal as _, Write as _};
+use std::io::{BufRead as _, BufReader, IsTerminal as _};
 use std::os::unix::fs::symlink;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// When `Command::spawn` forks, the child holds a copy of every open fd of
@@ -573,7 +574,7 @@ fn a_claim_held_until_process_exit_outlives_its_guard() {
 /// End a runtime through `block_on_serve` as `rmlx serve` does, with `claim`
 /// and one blocking job that runs until the returned sender is dropped.
 /// `exit_in` is the deadline the serve future returns.
-fn serve_to_the_exit(claim: &MetalClaim, exit_in: Duration) -> mpsc::Sender<()> {
+fn serve_to_the_exit(claim: &GpuClaim, exit_in: Duration) -> mpsc::Sender<()> {
     use crate::shutdown::shutdown_tests::{held_job, runtime, serving};
     use crate::shutdown::{block_on_serve_within, ExitDeadline};
 
@@ -587,7 +588,7 @@ fn serve_to_the_exit(claim: &MetalClaim, exit_in: Duration) -> mpsc::Sender<()> 
     )
     .expect("the shutdown is not an error");
     assert!(
-        !job.finished.load(std::sync::atomic::Ordering::Acquire),
+        !job.finished.load(Ordering::Acquire),
         "the job ended before the runtime did"
     );
     job.release
@@ -600,7 +601,7 @@ fn serve_to_the_exit(claim: &MetalClaim, exit_in: Duration) -> mpsc::Sender<()> 
 fn a_job_left_at_the_exit_deadline_keeps_the_claim_past_its_guard() {
     let dir = TempDir::new().expect("temp dir");
     let lock = lock_in(&dir);
-    let claim = claim_at(&lock).expect("first claim");
+    let claim = GpuClaim::Metal(claim_at(&lock).expect("first claim"));
 
     let release = serve_to_the_exit(&claim, Duration::from_millis(100));
 
@@ -622,7 +623,7 @@ fn a_shutdown_with_no_job_left_frees_the_claim_with_its_guard() {
     let _no_spawn = no_spawn();
     let dir = TempDir::new().expect("temp dir");
     let lock = lock_in(&dir);
-    let claim = claim_at(&lock).expect("first claim");
+    let claim = GpuClaim::Metal(claim_at(&lock).expect("first claim"));
     let far = Duration::from_secs(120);
 
     block_on_serve_within(
@@ -635,4 +636,465 @@ fn a_shutdown_with_no_job_left_frees_the_claim_with_its_guard() {
 
     drop(claim);
     drop(claim_at(&lock).expect("the claim is free after a clean shutdown"));
+}
+
+#[test]
+fn budget_reservations_are_serialized_under_race_for_fifty_rounds() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const THREADS: usize = 5;
+    const SYNTHETIC_RAM_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+    const EXPECTED_LIMIT_GB: f64 = 8.5;
+
+    for round in 0..50 {
+        let dir = TempDir::new().expect("temporary ledger directory");
+        let claim_path = dir.path().join("claim");
+        let path = dir.path().join("budget.json");
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        #[allow(
+            clippy::needless_collect,
+            reason = "spawn every barrier participant before joining so the claims race concurrently"
+        )]
+        let workers = (0..THREADS)
+            .map(|_| {
+                let claim_path = claim_path.clone();
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    reserve_budget_coordinated_at(&claim_path, &path, 2.0, SYNTHETIC_RAM_BYTES)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let claims = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("reservation thread did not panic"))
+            .collect::<Vec<_>>();
+        let admitted = claims.iter().filter(|claim| claim.is_ok()).count();
+        assert_eq!(admitted, 4, "each round must admit only four 2-GiB claims");
+        assert!(claims
+            .iter()
+            .filter_map(|claim| claim.as_ref().err())
+            .all(|error| matches!(error, ClaimError::BudgetExceeded { .. })));
+
+        let ledger: BudgetLedger =
+            serde_json::from_slice(&std::fs::read(&path).expect("read ledger"))
+                .expect("parse ledger");
+        let allocated_gb = ledger
+            .entries
+            .iter()
+            .map(|entry| entry.requested_gb)
+            .sum::<f64>();
+        assert!(
+            allocated_gb <= EXPECTED_LIMIT_GB,
+            "round {round}: {allocated_gb} GiB exceeds {EXPECTED_LIMIT_GB} GiB"
+        );
+        assert_eq!(ledger.entries.len(), 4);
+
+        drop(claims);
+        let ledger: BudgetLedger =
+            serde_json::from_slice(&std::fs::read(&path).expect("read released ledger"))
+                .expect("parse released ledger");
+        assert!(ledger.entries.is_empty(), "all RAII claims should release");
+    }
+}
+
+#[test]
+fn budget_claim_drop_removes_only_its_entry() {
+    let dir = TempDir::new().expect("temporary ledger directory");
+    let path = dir.path().join("budget.json");
+    let first = reserve_budget_at(&path, 1.0, 4 * 1024 * 1024 * 1024)
+        .expect("first reservation fits under 3.4 GiB");
+    let second = reserve_budget_at(&path, 1.0, 4 * 1024 * 1024 * 1024)
+        .expect("second reservation fits under 3.4 GiB");
+    drop(first);
+    let ledger: BudgetLedger =
+        serde_json::from_slice(&std::fs::read(&path).expect("read ledger")).expect("parse ledger");
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(ledger.entries[0].id, second.id);
+}
+
+#[test]
+fn budget_claim_reaps_dead_pid_when_next_process_registers() {
+    let dead_pid = (1_000_000..1_001_000)
+        .find(|pid| matches!(rmlx_core::system::process_exists(*pid), Ok(false)))
+        .expect("find a PID that does not exist");
+    let dir = TempDir::new().expect("temporary ledger directory");
+    let path = dir.path().join("budget.json");
+    let mut ledger = BudgetLedger {
+        available_gb: 3.4,
+        entries: vec![BudgetEntry {
+            id: "orphan".to_owned(),
+            pid: dead_pid,
+            requested_gb: 3.0,
+            argv: vec!["rmlx".to_owned(), "serve".to_owned()],
+        }],
+    };
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&ledger).expect("serialize seed ledger"),
+    )
+    .expect("write seed ledger");
+    ledger.entries.clear();
+
+    let _claim = reserve_budget_at(&path, 1.0, 4 * 1024 * 1024 * 1024)
+        .expect("orphaned reservation should be reclaimed");
+    let actual: BudgetLedger =
+        serde_json::from_slice(&std::fs::read(&path).expect("read ledger")).expect("parse ledger");
+    assert_eq!(actual.entries.len(), 1);
+    assert_ne!(actual.entries[0].id, "orphan");
+}
+
+#[test]
+fn legacy_claim_path_does_not_create_a_budget_ledger() {
+    let dir = TempDir::new().expect("temporary claim directory");
+    let claim_path = dir.path().join("metal.claim");
+    let ledger_path = dir.path().join("budget.json");
+    let claim =
+        claim_default_at(&claim_path, &ledger_path).expect("default exclusive claim succeeds");
+    assert!(claim_path.exists());
+    assert!(
+        !ledger_path.exists(),
+        "legacy claim must not create a ledger"
+    );
+    drop(claim);
+}
+
+#[test]
+fn probe_refuses_while_a_budget_reservation_is_live() {
+    let dir = TempDir::new().expect("temporary claim directory");
+    let claim_path = dir.path().join("metal.claim");
+    let ledger_path = dir.path().join("budget.json");
+    let legacy_dir = dir.path().join("legacy");
+    std::fs::create_dir(&legacy_dir).expect("legacy directory");
+    let budget =
+        reserve_budget_coordinated_at(&claim_path, &ledger_path, 1.0, 8 * 1024 * 1024 * 1024)
+            .expect("budget reservation");
+
+    let result = probe_in_with_ledger(&legacy_dir, &claim_path, Some(&ledger_path));
+    assert!(
+        matches!(result, Err(ClaimError::AlreadyHeld { .. })),
+        "claim probe must see experimental reservations: {result:?}"
+    );
+    drop(budget);
+    assert!(probe_in_with_ledger(&legacy_dir, &claim_path, Some(&ledger_path)).is_ok());
+}
+
+#[test]
+fn default_exclusive_claim_refuses_a_live_budget_reservation() {
+    let dir = TempDir::new().expect("temporary claim directory");
+    let claim_path = dir.path().join("rmlx.claim");
+    let ledger_path = dir.path().join("rmlx.budget.json");
+    let budget =
+        reserve_budget_coordinated_at(&claim_path, &ledger_path, 1.0, 8 * 1024 * 1024 * 1024)
+            .expect("budget claim is admitted");
+
+    let refused = claim_default_at(&claim_path, &ledger_path);
+    let Err(ClaimError::AlreadyHeld {
+        holder_pid,
+        holder_command,
+        ..
+    }) = refused
+    else {
+        panic!("default claim must refuse a live budget holder, got {refused:?}");
+    };
+    assert_eq!(holder_pid, Some(std::process::id()));
+    assert!(holder_command.contains("rmlx"));
+
+    drop(budget);
+    drop(claim_default_at(&claim_path, &ledger_path).expect("default claim after budget drop"));
+}
+
+#[test]
+fn budget_reservation_refuses_a_live_default_exclusive_claim() {
+    let dir = TempDir::new().expect("temporary claim directory");
+    let claim_path = dir.path().join("rmlx.claim");
+    let ledger_path = dir.path().join("rmlx.budget.json");
+    let exclusive = claim_at(&claim_path).expect("default claim acquired");
+
+    let refused =
+        reserve_budget_coordinated_at(&claim_path, &ledger_path, 1.0, 8 * 1024 * 1024 * 1024);
+    assert!(
+        matches!(refused, Err(ClaimError::AlreadyHeld { .. })),
+        "budget path must refuse while default claim is held: {refused:?}"
+    );
+    assert!(
+        !ledger_path.exists(),
+        "a refused budget claim must not create the ledger"
+    );
+    drop(exclusive);
+}
+
+#[test]
+fn default_and_budget_claim_race_has_one_winner_for_fifty_rounds() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    enum Winner {
+        Default(MetalClaim),
+        Budget(MemoryBudgetClaim),
+    }
+
+    for round in 0..10 {
+        let dir = TempDir::new().expect("temporary claim directory");
+        let claim_path = dir.path().join("rmlx.claim");
+        let ledger_path = dir.path().join("rmlx.budget.json");
+        let barrier = Arc::new(Barrier::new(3));
+        let default_path = claim_path.clone();
+        let default_ledger = ledger_path.clone();
+        let default_barrier = Arc::clone(&barrier);
+        let default = thread::spawn(move || {
+            default_barrier.wait();
+            claim_default_at(&default_path, &default_ledger).map(Winner::Default)
+        });
+        let budget_barrier = Arc::clone(&barrier);
+        let budget = thread::spawn(move || {
+            budget_barrier.wait();
+            reserve_budget_coordinated_at(&claim_path, &ledger_path, 1.0, 8 * 1024 * 1024 * 1024)
+                .map(Winner::Budget)
+        });
+        barrier.wait();
+
+        let default_result = default.join().expect("default thread did not panic");
+        let budget_result = budget.join().expect("budget thread did not panic");
+        let winners = usize::from(default_result.is_ok()) + usize::from(budget_result.is_ok());
+        assert_eq!(winners, 1, "round {round}: mixed-mode arbitration failed");
+        assert!(
+            matches!(default_result.as_ref(), Err(ClaimError::AlreadyHeld { .. }))
+                || matches!(budget_result.as_ref(), Err(ClaimError::AlreadyHeld { .. })),
+            "losing mode must fail closed"
+        );
+        match (default_result, budget_result) {
+            (Ok(Winner::Default(claim)), Err(_)) => drop(claim),
+            (Err(_), Ok(Winner::Budget(claim))) => drop(claim),
+            _ => panic!("exactly one valid winner is required"),
+        }
+    }
+}
+
+#[test]
+fn invalid_ledger_entry_fails_closed_instead_of_reducing_allocated_total() {
+    let dir = TempDir::new().expect("temporary ledger directory");
+    let path = dir.path().join("budget.json");
+    let forged = BudgetLedger {
+        available_gb: 8.5,
+        entries: vec![BudgetEntry {
+            id: "forged-negative".to_owned(),
+            pid: std::process::id(),
+            requested_gb: -100.0,
+            argv: Vec::new(),
+        }],
+    };
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&forged).expect("serialize ledger"),
+    )
+    .expect("write ledger");
+
+    assert!(
+        matches!(
+            reserve_budget_at(&path, 1.0, 10 * 1024 * 1024 * 1024),
+            Err(ClaimError::Io { source, .. }) if source.kind() == io::ErrorKind::InvalidData
+        ),
+        "invalid ledger entries must fail closed"
+    );
+}
+
+#[test]
+fn atomic_ledger_write_failure_preserves_the_previous_ledger() {
+    let dir = TempDir::new().expect("temporary ledger directory");
+    let path = dir.path().join("budget.json");
+    let old = BudgetLedger {
+        available_gb: 8.5,
+        entries: vec![BudgetEntry {
+            id: "live-before-failure".to_owned(),
+            pid: std::process::id(),
+            requested_gb: 2.0,
+            argv: vec!["rmlx".to_owned(), "serve".to_owned()],
+        }],
+    };
+    let old_bytes = serde_json::to_vec_pretty(&old).expect("serialize old ledger");
+    std::fs::write(&path, &old_bytes).expect("write old ledger");
+    let new = BudgetLedger {
+        available_gb: 8.5,
+        entries: Vec::new(),
+    };
+    let (file, created) = open_budget_file(&path).expect("open ledger");
+    assert!(!created);
+    file.lock().expect("lock ledger");
+
+    let result = write_budget_ledger_with_hook(&path, &new, || {
+        Err(io::Error::other("injected failure before publish"))
+    });
+    assert!(matches!(result, Err(ClaimError::Io { .. })));
+    assert_eq!(
+        std::fs::read(&path).expect("read retained ledger"),
+        old_bytes,
+        "failed transaction must leave the live ledger byte-for-byte intact"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .expect("list ledger directory")
+            .count(),
+        1,
+        "temporary file should be removed after an ordinary write failure"
+    );
+}
+
+#[test]
+fn existing_empty_ledger_fails_closed() {
+    let dir = TempDir::new().expect("temporary ledger directory");
+    let path = dir.path().join("budget.json");
+    std::fs::write(&path, []).expect("create empty ledger");
+    assert!(matches!(
+        reserve_budget_at(&path, 1.0, 8 * 1024 * 1024 * 1024),
+        Err(ClaimError::Io { source, .. }) if source.kind() == io::ErrorKind::InvalidData
+    ));
+}
+
+struct BudgetHolder {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    pid: u32,
+}
+
+impl BudgetHolder {
+    fn start(claim_path: &Path, ledger_path: &Path, requested_gb: f64) -> Self {
+        let spawn = no_spawn();
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "claim::tests::budget_claim_holder_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start budget holder child");
+        drop(spawn);
+        let pid = child.id();
+        let mut stdin = child.stdin.take().expect("child stdin");
+        writeln!(stdin, "{}", claim_path.display()).expect("send claim path");
+        writeln!(stdin, "{}", ledger_path.display()).expect("send ledger path");
+        writeln!(stdin, "{requested_gb}").expect("send reservation");
+        stdin.flush().expect("flush holder configuration");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let registered = std::fs::read(ledger_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<BudgetLedger>(&bytes).ok())
+                .is_some_and(|ledger| ledger.entries.iter().any(|entry| entry.pid == pid));
+            if registered {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child {pid} did not register its reservation"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        BudgetHolder {
+            child,
+            stdin: Some(stdin),
+            pid,
+        }
+    }
+
+    fn kill(mut self) {
+        self.child.kill().expect("kill budget holder");
+        self.child.wait().expect("wait for killed budget holder");
+    }
+
+    fn release(mut self) {
+        drop(self.stdin.take());
+        let status = self.child.wait().expect("wait for released holder");
+        assert!(status.success(), "budget holder failed: {status}");
+    }
+}
+
+#[test]
+#[ignore = "child process of the multi-process budget reservation test"]
+fn budget_claim_holder_child() {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return;
+    }
+    let mut input = stdin.lock();
+    let mut claim_path = String::new();
+    let mut ledger_path = String::new();
+    let mut requested_gb = String::new();
+    if input.read_line(&mut claim_path).is_err()
+        || input.read_line(&mut ledger_path).is_err()
+        || input.read_line(&mut requested_gb).is_err()
+    {
+        return;
+    }
+    let claim_path = PathBuf::from(claim_path.trim());
+    let ledger_path = PathBuf::from(ledger_path.trim());
+    let Ok(requested_gb) = requested_gb.trim().parse::<f64>() else {
+        return;
+    };
+    let Ok(claim) = reserve_budget_coordinated_at(
+        &claim_path,
+        &ledger_path,
+        requested_gb,
+        10 * 1024 * 1024 * 1024,
+    ) else {
+        return;
+    };
+    println!("held {}", std::process::id());
+    io::stdout().flush().expect("flush held status");
+    let mut rest = Vec::new();
+    let _ = input.read_to_end(&mut rest);
+    drop(claim);
+}
+
+#[test]
+fn separate_process_reservations_are_reaped_after_sigkill() {
+    let dir = TempDir::new().expect("temporary coordination directory");
+    let claim_path = dir.path().join("rmlx.claim");
+    let ledger_path = dir.path().join("rmlx.budget.json");
+    let first = BudgetHolder::start(&claim_path, &ledger_path, 2.0);
+    let second = BudgetHolder::start(&claim_path, &ledger_path, 2.0);
+    assert_ne!(first.pid, second.pid);
+
+    let ledger: BudgetLedger =
+        serde_json::from_slice(&std::fs::read(&ledger_path).expect("read live ledger"))
+            .expect("parse live ledger");
+    let pids = ledger
+        .entries
+        .iter()
+        .map(|entry| entry.pid)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(pids.len(), 2, "ledger must hold entries from two PIDs");
+    assert!(pids.contains(&first.pid) && pids.contains(&second.pid));
+
+    let dead_pid = first.pid;
+    first.kill();
+    let own =
+        reserve_budget_coordinated_at(&claim_path, &ledger_path, 2.0, 10 * 1024 * 1024 * 1024)
+            .expect("registration reaps the SIGKILLed process before admission");
+    let ledger: BudgetLedger =
+        serde_json::from_slice(&std::fs::read(&ledger_path).expect("read reaped ledger"))
+            .expect("parse reaped ledger");
+    assert_eq!(ledger.entries.len(), 2);
+    assert!(ledger.entries.iter().all(|entry| entry.pid != dead_pid));
+    assert!(ledger.entries.iter().any(|entry| entry.pid == second.pid));
+    assert!(ledger
+        .entries
+        .iter()
+        .any(|entry| entry.pid == std::process::id()));
+
+    drop(own);
+    second.release();
+    let ledger: BudgetLedger =
+        serde_json::from_slice(&std::fs::read(&ledger_path).expect("read cleared ledger"))
+            .expect("parse cleared ledger");
+    assert!(ledger.entries.is_empty());
 }

@@ -10,6 +10,7 @@ pub(crate) mod gpu_capture;
 pub(crate) mod healthcheck;
 pub(crate) mod info;
 pub(crate) mod kv_calibrate;
+pub(crate) mod memory_estimate;
 pub(crate) mod metrics;
 pub(crate) mod parse;
 pub(crate) mod preset_table;
@@ -23,10 +24,11 @@ pub(crate) use eval::run_ppl;
 pub(crate) use healthcheck::run_healthcheck;
 pub(crate) use info::run_info;
 pub(crate) use kv_calibrate::run_kv_calibrate;
+pub(crate) use memory_estimate::run_estimate_memory;
 pub(crate) use parse::{
     build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo, parse_kv_bits_fractional,
     parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant, parse_max_ctx,
-    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg,
+    parse_max_prompt_tokens, parse_serve_device, resolve_model_flags, resolve_preset_arg,
 };
 pub(crate) use profile::run_profile_list;
 pub(crate) use serve::run_serve;

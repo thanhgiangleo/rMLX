@@ -49,7 +49,10 @@ pub mod tokenizer_io;
 pub mod tool_parser;
 pub(crate) mod tts_sampling;
 
-pub use claim::{probe_claim, try_claim, ClaimError, MetalClaim};
+pub use claim::{
+    probe_claim, try_claim, try_claim_with_budget, ClaimError, GpuClaim, MemoryBudgetClaim,
+    MetalClaim,
+};
 
 use std::net::SocketAddr;
 

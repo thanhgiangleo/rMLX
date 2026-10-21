@@ -14,6 +14,14 @@ fn parse_device_cpu_takes_no_claim() {
     assert!(!cpu.holds_claim());
 }
 
+#[test]
+fn serve_without_budget_uses_the_existing_cpu_device_path() {
+    let cpu = parse_serve_device("cpu", None).expect("default serve parser accepts CPU");
+    assert_eq!(cpu.device(), Device::Cpu);
+    assert!(!cpu.holds_claim());
+    assert!(parse_serve_device("cpu", Some(1.0)).is_err());
+}
+
 /// Only [`parse_device`] arms the GPU latch: the flag parser and the const CPU
 /// device do not, so an in-process test never forbids the GPU for its binary.
 #[test]

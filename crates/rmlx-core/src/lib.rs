@@ -34,6 +34,7 @@ pub mod mach_mem;
 pub mod paths;
 pub mod projects_config;
 pub mod runinfo;
+pub mod system;
 
 pub use dispatch_policy::{dispatch_policy, set_dispatch_policy, DispatchPolicy};
 pub use error::Error;

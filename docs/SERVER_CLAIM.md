@@ -49,3 +49,39 @@ enough to tell whether it is held, not to hold it. It skips a vanished
 entry, a symlink, or anything that is not a regular file. Any other open
 error there refuses every GPU command with an I/O error, not exit `11`.
 Nothing is deleted. Removed in the release after next.
+
+## Experimental multi-process memory budget
+
+`rmlx serve --experimental-multi-process-budget <GB_f64>` opts one server
+into a separate machine-wide reservation ledger at
+`/var/tmp/rmlx.budget.json`. With the flag absent, `serve` still calls
+`try_claim()` and retains the exclusive `/var/tmp/rmlx.claim` flock and its
+exit-code-11 refusal behavior. There is no environment-variable switch. Use
+`--device gpu`; the flag is refused for CPU mode.
+
+The ledger's `available_gb` is physical RAM reported by macOS `hw.memsize`
+minus the fixed 15% OS headroom. Each entry records a unique id, PID, requested
+GiB, and argv. Registration and release read-modify-write the same regular,
+single-link ledger file while holding its exclusive `flock`; the file is never
+removed. A reservation that does not fit returns a named budget refusal and
+CLI exit code `12`. Each live process removes its entry on normal Drop. A later
+Both the default exclusive path and the budget path arbitrate through the
+existing `/var/tmp/rmlx.claim` flock: default mode holds it for its lifetime
+after confirming the ledger is empty; budget mode holds it through the
+ledger check-and-register transaction. This prevents mixed-mode overlap and
+serializes a switch between modes. A probe also checks the ledger while
+holding the coordination flock.
+
+The ledger registrant checks PIDs with `kill(pid, 0)` and reaps entries whose process is
+gone; an indeterminate liveness check is retained conservatively. If a server
+shutdown deadline leaves a blocking GPU job running, its reservation remains
+until a later ledger operation observes that the process has exited.
+
+This is an **experimental reservation**, not a measured peak-memory guard.
+It counts the operator-supplied per-process amount; it does not measure Metal
+peak allocation, `phys_footprint`, model-load transients, or prompt-cache use.
+Do not run multiple real model processes until the G2.6 memory preflight is
+complete. To roll back, stop all budget-mode processes before launching
+without the flag; the default exclusive mode cannot coordinate with a budget
+process that is still live. This code does not remove or rewrite the legacy
+claim file and is not a production go-live approval.
