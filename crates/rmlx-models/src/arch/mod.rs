@@ -635,6 +635,10 @@ impl Architecture {
     /// This preserves each request's cache offset and KV codec, including
     /// codecs whose fused kernels only accept batch size one. This low-level
     /// primitive does not itself own a request scheduler.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "non-batched architectures intentionally fail closed; this arm is the capability fallback"
+    )]
     pub fn forward_batched_decode(
         &self,
         input_ids: &Array,

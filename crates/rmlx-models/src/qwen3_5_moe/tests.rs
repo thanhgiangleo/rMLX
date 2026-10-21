@@ -7,7 +7,9 @@
     clippy::manual_let_else,
     clippy::match_wildcard_for_single_variants,
     clippy::stable_sort_primitive,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::indexing_slicing,
+    clippy::expect_used
 )]
 use super::*;
 

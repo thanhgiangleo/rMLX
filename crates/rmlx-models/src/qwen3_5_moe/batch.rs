@@ -12,6 +12,13 @@
 //! separate layer: no server flag opts into this path until that integration
 //! and its end-to-end queue/stream tests are present.
 
+#![allow(
+    clippy::indexing_slicing,
+    clippy::needless_range_loop,
+    clippy::expect_used,
+    reason = "batch and layer dimensions are validated before dispatch; the remaining indexed accesses follow those shape invariants"
+)]
+
 use rmlx_core::error::{Error, Result};
 use rmlx_kv_quant::{KvCache, LinearAttnCache};
 use rmlx_mlx::{add, concatenate, Array, Device};
@@ -27,7 +34,7 @@ fn batch_row(array: &Array, row: i32, device: Device) -> Result<Array> {
         )));
     }
     let mut starts = vec![0; shape.len()];
-    let mut ends = shape.to_vec();
+    let mut ends = shape.clone();
     let steps = vec![1; shape.len()];
     starts[0] = row;
     ends[0] = row + 1;
