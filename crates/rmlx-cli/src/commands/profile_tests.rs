@@ -50,3 +50,38 @@ fn empty_document_parses() {
     let parsed = ProfilesFile::from_toml("").expect("parse empty");
     assert!(parsed.profile.is_empty());
 }
+
+#[test]
+fn draft_block_size_round_trips_through_profile_toml() {
+    // Pins the new field added for the MTP-default-on-coder decision:
+    // draft_block_size has a profile key (unlike draft_kind), because a block
+    // size is not self-declared by every drafter the way a drafter's kind is.
+    let src = r#"
+[profile.coder]
+model = "/models/qwen38-coder"
+draft_model = "/models/qwen38-coder-mtp-sidecar"
+draft_block_size = 4
+"#;
+    let parsed = ProfilesFile::from_toml(src).expect("parse");
+    let coder = parsed.get("coder").expect("coder present");
+    assert_eq!(
+        coder.draft_model,
+        Some(PathBuf::from("/models/qwen38-coder-mtp-sidecar"))
+    );
+    assert_eq!(coder.draft_block_size, Some(4));
+
+    let serialised = parsed.to_toml().expect("serialise");
+    let reparsed = ProfilesFile::from_toml(&serialised).expect("reparse");
+    assert_eq!(parsed, reparsed);
+}
+
+#[test]
+fn absent_draft_block_size_falls_through_to_none() {
+    // A profile naming draft_model but not draft_block_size must not invent
+    // one — the engine's own resolution (DEFAULT_BLOCK_SIZE or the drafter's
+    // declaration) owns that default, not this parser.
+    let parsed = ProfilesFile::from_toml("[profile.bare]\ndraft_model = \"/models/sidecar\"\n")
+        .expect("parse");
+    let bare = parsed.get("bare").expect("bare present");
+    assert_eq!(bare.draft_block_size, None);
+}

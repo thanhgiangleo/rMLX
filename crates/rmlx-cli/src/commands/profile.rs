@@ -13,6 +13,8 @@
 //! host = "0.0.0.0"
 //! kv_quant = "k8v4"
 //! max_ctx = 8192
+//! draft_model = "/abs/path/to/mtp-sidecar"
+//! draft_block_size = 4
 //! ```
 //!
 //! Resolution: `[profile.<name>]` is loaded from [`rmlx_core::paths::profiles_path`]
@@ -55,6 +57,18 @@ pub(crate) struct ServeProfile {
     pub idle_timeout_secs: Option<u64>,
     pub prompt_cache_slots: Option<usize>,
     pub draft_model: Option<PathBuf>,
+    /// The round block a request that names none runs at, for this profile's
+    /// `draft_model`. Unlike `draft_kind` (still CLI-only: a drafter's own
+    /// snapshot already declares its kind, so a profile naming one that
+    /// contradicts it would be a second, conflicting producer of that fact),
+    /// a block size is not self-declared by every drafter — the MTP sidecar
+    /// chains past its own declared depth, so a profile is a legitimate place
+    /// to pin a block an operator measured and wants this profile to default
+    /// to, without which the engine falls back to
+    /// `rmlx_models::speculative::DEFAULT_BLOCK_SIZE` (5) or the drafter's own
+    /// declaration, whichever that pair resolves to. A CLI `--draft-block-size`
+    /// still wins over this, same override order as every other profile field.
+    pub draft_block_size: Option<usize>,
     pub max_tokens_cap: Option<u32>,
     pub max_timeout_secs: Option<u64>,
     pub max_loaded_models: Option<usize>,

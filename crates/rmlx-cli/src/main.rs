@@ -2117,8 +2117,14 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 .or_else(|| p.and_then(|x| x.prompt_cache_slots))
                 .unwrap_or(DEFAULT_PROMPT_CACHE_SLOTS);
             let draft_model = draft_model.or_else(|| p.and_then(|x| x.draft_model.clone()));
-            // draft_kind / draft_block_size have no profile key; a profile's
-            // draft_model runs at the kind its snapshot declares.
+            // draft_kind has no profile key: a profile's draft_model runs at
+            // the kind its snapshot declares, and a profile value here would
+            // be a second, possibly-contradicting producer of that fact.
+            // draft_block_size DOES have a profile key — unlike draft_kind, a
+            // block size is not self-declared by every drafter (the MTP
+            // sidecar chains past its own declaration), so a profile is a
+            // legitimate place to pin one an operator measured. CLI still wins.
+            let draft_block_size = draft_block_size.or_else(|| p.and_then(|x| x.draft_block_size));
             let draft_kind: Option<rmlx_models::DraftKind> = draft_kind.map(Into::into);
             let max_tokens_cap = max_tokens_cap
                 .or_else(|| p.and_then(|x| x.max_tokens_cap))
