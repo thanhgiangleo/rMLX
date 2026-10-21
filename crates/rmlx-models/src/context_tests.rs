@@ -249,6 +249,8 @@ const CEILING_CONSUMERS: &[&str] = &[
     "crates/rmlx-models/src/qwen3_vl_moe/generate.rs",
     // Server: the load-time ceiling behind the admission guard.
     "crates/rmlx-server/src/engine/arch_generator.rs",
+    // Server: the Qwen3.5 continuous batcher's per-row KV ring.
+    "crates/rmlx-server/src/engine/batched.rs",
     "crates/rmlx-server/src/engine/speculative.rs",
     // Server: a per-request `max_ctx` override.
     "crates/rmlx-server/src/openai/chat.rs",

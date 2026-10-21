@@ -18,6 +18,7 @@ rmlx-kv-quant = { workspace = true }
 rmlx-kv-ssd  = { workspace = true }
 rmlx-metrics = { workspace = true }
 rmlx-models  = { workspace = true }
+rmlx-runtime = { workspace = true }
 rmlx-loader  = { workspace = true }
 rmlx-mlx     = { workspace = true }
 anyhow       = { workspace = true }

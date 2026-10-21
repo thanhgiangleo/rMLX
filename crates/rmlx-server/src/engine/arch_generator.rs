@@ -69,19 +69,18 @@ fn no_tower_for(input: &str, tower: &str) -> Error {
     reason = "internal generator implementation — field set is coupled to the model-load lifecycle; adding a field requires updating from_snapshot and all constructors"
 )]
 pub struct ArchGenerator {
-    model: Arc<rmlx_models::arch::Architecture>,
-    tokenizer: Arc<tokenizers::Tokenizer>,
-    device: rmlx_mlx::Device,
-    model_id: String,
-    /// Serialises concurrent calls. A second request blocks until the first
-    /// finishes. `tracing::warn!` fires so the operator can see contention.
-    /// Serialisation covers the CPU path too: the Metal context is exclusive
-    /// per process and MLX allocates compute threads per stream, so concurrent
-    /// generation is unsafe regardless of whether a request runs on GPU or CPU.
-    /// Wrapped in `Arc` so a clone of the handle can be moved into `spawn_blocking`.
-    _lock: Arc<Mutex<()>>,
+    pub(super) model: Arc<rmlx_models::arch::Architecture>,
+    pub(super) tokenizer: Arc<tokenizers::Tokenizer>,
+    pub(super) device: rmlx_mlx::Device,
+    pub(super) model_id: String,
+    /// Serialises reference-path generations and excludes them from the batch
+    /// worker. The experimental Qwen3.5 scheduler holds this same gate while it
+    /// owns the GPU and batches compatible rows. The gate also covers CPU runs:
+    /// concurrent generation is not safe on the shared MLX process context.
+    /// Wrapped in `Arc` so the worker can own a handle for its lifetime.
+    pub(super) _lock: Arc<Mutex<()>>,
     /// Server-startup-time KV quantization override. `None` = engine default.
-    kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
+    pub(super) kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     /// True when `--kv-quant <explicit>` was given at startup (not "auto").
     ///
     /// When `false` (auto mode), each request selects its KV mode via
@@ -90,15 +89,15 @@ pub struct ArchGenerator {
     /// regardless of context length.
     kv_quant_user_explicit: bool,
     /// Server-startup-time max context length override. `None` = derive from mpe (capped at 4096).
-    max_ctx_override: Option<i32>,
+    pub(super) max_ctx_override: Option<i32>,
     /// Number of prompt-cache slots for multi-slot prefix matching. Default 4.
     prompt_cache_slots: usize,
     /// EOS token ids parsed from config.json at load time. Empty when the
     /// field is missing — generate_greedy then runs to max_tokens.
-    eos_ids: Arc<Vec<u32>>,
+    pub(super) eos_ids: Arc<Vec<u32>>,
     /// Effective max prompt-context length used by the per-request guard —
     /// the ceiling `rmlx_models::context::resolve_context` produced at load.
-    effective_max_ctx: usize,
+    pub(super) effective_max_ctx: usize,
     /// The checkpoint's context limits. A per-request `max_ctx` override is
     /// resolved against these by the route layer.
     context_limits: rmlx_models::context::ContextLimits,
@@ -106,7 +105,7 @@ pub struct ArchGenerator {
     /// `decoder` node (mirrors mlx-lm). Drives the per-arch leading-space
     /// rule in the streaming UTF-8 token-healer. The byte-level withholding
     /// guard applies regardless of kind.
-    tokenizer_kind: crate::detokenizer::TokenizerKind,
+    pub(super) tokenizer_kind: crate::detokenizer::TokenizerKind,
     /// Gemma4 vision tower + multimodal embedder + image processor,
     /// loaded once at startup when the snapshot ships a `vision_config`.
     /// `None` for text-only checkpoints (the image path is then rejected with
@@ -128,6 +127,7 @@ pub struct ArchGenerator {
     /// `image_max_tokens` field takes precedence over this. A no-op for
     /// text-only / non-Gemma4 generators.
     image_max_tokens: Option<usize>,
+    batch_scheduler: Option<Arc<super::batched::ContinuousBatchScheduler>>,
 }
 
 impl std::fmt::Debug for ArchGenerator {
@@ -497,7 +497,22 @@ impl ArchGenerator {
             audio,
             mm_cache: load_cfg.mm_cache.clone(),
             image_max_tokens: load_cfg.image_max_tokens,
+            batch_scheduler: None,
         })
+    }
+
+    /// Enable the experimental continuous-batching scheduler for compatible
+    /// Qwen3.5-MoE text requests. Other architectures retain the reference path.
+    pub fn enable_continuous_batching(&mut self, batch_size: usize) {
+        self.batch_scheduler = super::batched::ContinuousBatchScheduler::attach(self, batch_size);
+        if batch_size > 1 && self.batch_scheduler.is_none() {
+            tracing::warn!(
+                model_id = %self.model_id,
+                batch_size,
+                arch = self.model.arch_class(),
+                "continuous batching requested but architecture is unsupported; retaining serial path"
+            );
+        }
     }
 
     /// The model id this generator serves (matches the snapshot's basename).
@@ -520,7 +535,17 @@ impl Generator for ArchGenerator {
     }
 
     fn kv_cache_bytes(&self) -> u64 {
-        self.model.kv_cache_bytes()
+        self.batch_scheduler.as_ref().map_or_else(
+            || self.model.kv_cache_bytes(),
+            |scheduler| {
+                let bytes = scheduler.last_kv_cache_bytes();
+                if bytes == 0 {
+                    self.model.kv_cache_bytes()
+                } else {
+                    bytes
+                }
+            },
+        )
     }
 
     fn load_phases(&self) -> Option<rmlx_models::LoadPhases> {
@@ -544,7 +569,8 @@ impl Generator for ArchGenerator {
         req: GenerationRequest,
     ) -> Pin<Box<dyn Stream<Item = rmlx_core::Result<GenerationToken>> + Send>> {
         // Defensive: caller (registry lookup) already validated this, but
-        // mismatches are programmer errors worth surfacing clearly.
+        // mismatches are programmer errors worth surfacing clearly. Check this
+        // before scheduler submission so a cohort can never mix model ids.
         if req.model_id != self.model_id {
             let served = self.model_id.clone();
             let asked = req.model_id;
@@ -553,6 +579,11 @@ impl Generator for ArchGenerator {
                     "model id mismatch: generator serves '{served}', got '{asked}'"
                 )))
             }));
+        }
+        if let Some(scheduler) = self.batch_scheduler.as_ref() {
+            if super::batched::compatible(&req) {
+                return scheduler.submit(req);
+            }
         }
 
         if req.prompt_tokens.is_empty() {

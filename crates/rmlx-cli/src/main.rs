@@ -677,13 +677,21 @@ enum Cmd {
         /// Maximum number of admitted-and-in-flight requests before new ones
         /// are rejected with HTTP 429 `server queue full`.
         ///
-        /// Requests serialise on the single GPU; this bounds the FIFO
-        /// admission queue depth so a burst cannot stack unbounded
-        /// `spawn_blocking` threads. Admitted requests are served in strict
-        /// FIFO arrival order. `0` = unlimited (FIFO +
+        /// A single GPU worker serialises individual requests by default; when
+        /// continuous batching is enabled, compatible requests share decode
+        /// ticks. This bounds the FIFO admission queue depth so a burst cannot
+        /// stack unbounded blocking work. `0` = unlimited (FIFO +
         /// queue metrics still apply, no 429). Default 64.
         #[arg(long)]
         max_queue_depth: Option<usize>,
+        /// Enable the experimental Qwen3.5-MoE continuous batch scheduler.
+        ///
+        /// `1` (default) preserves serial generation. Values 2–8 allow that
+        /// many compatible text requests to be admitted together; sampling and
+        /// penalties stay per-row. Unsupported features and architectures use
+        /// the reference path. New requests may join between decode ticks.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        experimental_batch_size: u8,
         /// Server-startup default temperature applied when a request omits the
         /// `temperature` field. Precedence: request > this > model
         /// generation_config.json > hard-coded 1.0.
@@ -2057,6 +2065,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             require_smoke_probe,
             max_loaded_models,
             max_queue_depth,
+            experimental_batch_size,
             default_temperature,
             enable_thinking,
             image_max_tokens,
@@ -2355,6 +2364,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 require_smoke_probe,
                 max_loaded_models,
                 max_queue_depth,
+                usize::from(experimental_batch_size),
                 default_temperature,
                 enable_thinking,
                 kv_ssd_cache_gb,

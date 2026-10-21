@@ -474,6 +474,7 @@ pub(crate) fn run_serve(
     require_smoke_probe: bool,
     max_loaded_models: usize,
     max_queue_depth: usize,
+    experimental_batch_size: usize,
     default_temperature: Option<f32>,
     enable_thinking: Option<bool>,
     kv_ssd_cache_gb: f64,
@@ -759,6 +760,7 @@ pub(crate) fn run_serve(
     // capture draft_kind + draft_block_size for the loader closure.
     let loader_draft_kind = draft_kind;
     let loader_draft_block_size = draft_block_size;
+    let loader_batch_size = experimental_batch_size;
     // One process-wide GPU serialisation gate. A clone is injected into
     // every generator the loader builds so the existing try_lock/warn/lock
     // critical section in `Generator::generate` serialises across ALL
@@ -873,12 +875,13 @@ pub(crate) fn run_serve(
                 has_calibration = effective_cfg.calibration.is_some(),
                 "loader: ArchGenerator::from_snapshot"
             );
-            let gen = ArchGenerator::from_snapshot_with_id(
+            let mut gen = ArchGenerator::from_snapshot_with_id(
                 path,
                 Some(id),
                 &effective_cfg,
                 Arc::clone(&gpu_gate_for_loader),
             )?;
+            gen.enable_continuous_batching(loader_batch_size);
             Ok(Box::new(gen) as Box<dyn rmlx_server::Generator>)
         }
     });
@@ -973,8 +976,9 @@ pub(crate) fn run_serve(
             // /v1/embeddings (jina-v4) path can reach it.
             mm_cache: Arc::clone(&mm_cache),
             gpu_gate,
-            // 1-permit semaphore = FIFO single-GPU serialisation.
-            gpu_queue: Arc::new(tokio::sync::Semaphore::new(1)),
+            // Default 1 permit preserves serial generation. Experimental
+            // Qwen3.5 continuous batching admits a bounded cohort at a time.
+            gpu_queue: Arc::new(tokio::sync::Semaphore::new(experimental_batch_size)),
             gpu_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_queue_depth,
             max_loaded_models,

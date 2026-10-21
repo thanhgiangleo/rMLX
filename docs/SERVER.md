@@ -41,12 +41,11 @@ sequences: request B makes no progress while request A runs. Per-arch prefill
 chunking bounds one request's memory; it does not schedule other requests
 between chunks.
 
-This fits the target workload: one user or one agent, with one generation in
-flight. Under concurrent load, aggregate throughput stays flat and a
-request's latency grows with the queue ahead of it. `max_queue_depth` and the
-adaptive admission controller shed load; neither adds parallelism. To serve
-many users at once, run several rMLX processes behind a load balancer, one
-Metal context each.
+The default remains one generation in flight. Under concurrent load, aggregate
+throughput stays flat and a request's latency grows with the queue ahead of it.
+`max_queue_depth` and the adaptive admission controller shed load; neither adds
+parallelism. The opt-in `--experimental-batch-size` Qwen3.5-MoE path is described
+below; it is a separate scheduling mode and does not change the default.
 
 ### GPU admission and queue depth
 
@@ -61,6 +60,27 @@ moment the request gets it and releases it when the request ends. Chat,
 messages and audio requests pass this gate.
 `/v1/embeddings` does not: it never returns 429, and it waits instead on the
 `gpu_gate` mutex that a running generation also holds.
+
+### Experimental Qwen3.5-MoE continuous batching
+
+`--experimental-batch-size N` (`N=1` by default, accepted range 1–8) raises
+chat admission to an N-permit cohort and attaches a single worker to a loaded
+Qwen3.5-MoE generator. The worker prefills each request into independent KV and
+GatedDeltaNet cache stacks, then calls `Architecture::forward_batched_decode`
+for active rows. New compatible requests may join between decode ticks;
+finished, cancelled, or disconnected rows leave at the next scheduler tick. This is dynamic
+continuous batching on decode, not batched prefill: prompt prefills are performed
+one request at a time.
+
+Eligibility is fail-closed. Text requests with independent sampler/RNG/history
+state can batch; logprobs, stop strings, JSON constraints, tools, session-cache
+requests, per-request KV/context overrides, image/audio, and speculative
+requests stay on the reference serial path. Prompt lengths above 512 tokens also
+fall back to serial chunked prefill. Only Qwen3.5-MoE exposes the batched forward;
+other architectures remain serial. KV prompt-cache reuse is not used by the
+batch path. The option is experimental and off by default; production enablement
+requires measured E2E correctness, throughput, memory safety, and rollback
+verification on the target workload.
 
 ### Adaptive admission controller
 

@@ -133,6 +133,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--max-timeout-secs` | u64 | `600` | Per-request wall-clock cap in seconds. `X-Request-Timeout-Seconds` can lower it. `0` disables it. |
 | `--max-loaded-models` | usize | `1` | Models held resident; the least recently used one is evicted past the cap. |
 | `--max-queue-depth` | usize | `64` | Admission queue depth; a request past it gets HTTP 429. `0` is unlimited. |
+| `--experimental-batch-size` | u8 | `1` | Opt-in Qwen3.5-MoE continuous batching, maximum active rows 1–8. `1` keeps the serial path. Compatible text requests dynamically join between decode ticks; unsupported request features/architectures fall back to serial generation. |
 | `--adaptive-admission` | bool flag | off | Adaptive admission controller: adjusts the queue depth and answers 503 with `Retry-After` when the predicted step time exceeds twice `--step-target-ms`. See [`SERVER.md`](SERVER.md) § "Adaptive admission controller". |
 | `--step-target-ms` | u64 | `500` | End-to-end step target. Hidden alias `--ttft-target-ms`. No effect without `--adaptive-admission`. |
 | `--itl-target-ms` | u64 | `50` | Inter-token latency target. No effect without `--adaptive-admission`. |
