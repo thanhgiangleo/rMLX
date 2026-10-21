@@ -1504,6 +1504,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProfileCmd,
     },
+    /// Decide a speculative-decode winner from already-measured rows —
+    /// distilled from MTPLX's depth-sweep tuner (`youssofal/MTPLX`,
+    /// `mtplx/commands/public.py::_best_multiplier_summary`). Not a
+    /// benchmarking engine: it reads one baseline (no-drafter) decode rate and
+    /// one or more candidate rows (each already measured with `rmlx bench`,
+    /// `rmlx serve` + a client, or `scripts/spec_bench.sh`, and each carrying
+    /// `block_size`, `decode_tps` and `accept_rate` — the same fields
+    /// `scripts/lib/spec_round_log.py` already reads back from a round-loop
+    /// `done` event) and decides honestly which, if any, is a real win. See
+    /// `crates/rmlx-cli/src/commands/tune.rs` module docs for the exact
+    /// gates it applies.
+    Tune {
+        #[command(subcommand)]
+        cmd: TuneCmd,
+    },
     /// Hold the machine-wide Metal claim for a command that is not rmlx.
     Claim {
         #[command(subcommand)]
@@ -1686,6 +1701,32 @@ enum EvalCmd {
 enum ProfileCmd {
     /// List the names of all defined profiles, one per line.
     List,
+}
+
+/// `rmlx tune <subcommand>`.
+#[derive(Subcommand, Debug)]
+enum TuneCmd {
+    /// Decide a winner among already-measured speculative-decode candidates.
+    /// Reads a JSON file shaped as `commands::tune::TuneSweepInput`
+    /// (one `baseline` object plus a `candidates` map of label -> row);
+    /// prints a human summary, or the full `TuneDecision` with `--json`.
+    /// Exit code is always 0 — a decision of "no winner" is a successful
+    /// answer, not a command failure; a malformed input file is the only
+    /// non-zero case.
+    Decide {
+        /// Path to the sweep-input JSON file.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        /// Smallest `(candidate/baseline - 1) * 100` this call accepts as a
+        /// real win rather than measurement noise. Pass the drift bound of
+        /// whatever instrument produced the rows (e.g. `rmlx bench`'s
+        /// `TREND_MAX_DRIFT_PCT`) rather than guessing one.
+        #[arg(long, default_value_t = 10.0, value_name = "PCT")]
+        min_margin_pct: f64,
+        /// Emit the full decision as one JSON object instead of a human summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// `rmlx claim <subcommand>`.
@@ -1986,6 +2027,21 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
         return commands::claim_run::run_claim_run(command);
     }
 
+    // `rmlx tune decide` is a pure decision over an already-measured JSON
+    // file: no model load, no Metal claim, no per-request metrics event to
+    // record — it short-circuits like `metrics`/`profile`.
+    if let Cmd::Tune {
+        cmd:
+            TuneCmd::Decide {
+                file,
+                min_margin_pct,
+                json,
+            },
+    } = &cli.cmd
+    {
+        return commands::tune::run_tune_decide(file, *min_margin_pct, *json);
+    }
+
     // `rmlx kv-calibrate` runs without opening the EventRecorder. The
     // head-budget recipes hold the claim from the model load to the end of
     // the measurement; the weight-norm recipes (turbo*) are CPU-only.
@@ -2018,13 +2074,13 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
 
     #[allow(
         clippy::unreachable,
-        reason = "Cmd::Metrics, Cmd::Profile, Cmd::Claim and Cmd::KvCalibrate are handled by \
-                  early blocks above that return; reaching these arms means the early-return \
-                  guard was removed — a BUG"
+        reason = "Cmd::Metrics, Cmd::Profile, Cmd::Claim, Cmd::KvCalibrate and Cmd::Tune are \
+                  handled by early blocks above that return; reaching these arms means the \
+                  early-return guard was removed — a BUG"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "Metrics + Profile + Claim + KvCalibrate arms are unreachable!() guards \
+        reason = "Metrics + Profile + Claim + KvCalibrate + Tune arms are unreachable!() guards \
                   documenting distinct early-return commands above; collapsing them would \
                   lose the Cmd-specific BUG narrative"
     )]
@@ -2033,6 +2089,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
         Cmd::Profile { .. } => unreachable!("handled above"),
         Cmd::Claim { .. } => unreachable!("handled above"),
         Cmd::KvCalibrate { .. } => unreachable!("handled above"),
+        Cmd::Tune { .. } => unreachable!("handled above"),
         Cmd::Serve {
             model,
             registry,

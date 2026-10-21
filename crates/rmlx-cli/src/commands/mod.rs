@@ -16,6 +16,7 @@ pub(crate) mod preset_table;
 pub(crate) mod profile;
 pub(crate) mod serve;
 pub(crate) mod transcribe;
+pub(crate) mod tune;
 
 pub(crate) use baseline::run_baseline;
 pub(crate) use bench::run_bench;
